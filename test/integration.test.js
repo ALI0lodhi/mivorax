@@ -27,7 +27,7 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
     await t.test('seed is idempotent and public catalog uses actual MongoDB IDs', async () => {
       await seedDatabase({ email, password });
       const products = await request('/products');
-      assert.equal(products.body.length, 4);
+      assert.equal(products.body.length, 0); // Seed concepts never appear in the live catalog.
       assert(products.body.every(p => mongoose.isValidObjectId(p._id)));
       assert.equal(await Product.countDocuments(), 4);
       assert.equal((await request('/health')).body.transactions, true);
