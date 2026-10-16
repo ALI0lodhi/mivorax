@@ -1,0 +1,26 @@
+{
+  "name": "@mivorax/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/index.js",
+    "start": "node --env-file-if-exists=.env src/start.js",
+    "seed": "node --env-file-if-exists=.env src/seed.js",
+    "test": "node --test test/commerce.test.js test/catalog.test.js test/security.test.js",
+    "db:local": "node --env-file-if-exists=.env src/local-db.js",
+    "test:integration": "node --env-file-if-exists=.env --test test/integration.test.js",
+    "db:secure": "node --env-file-if-exists=.env src/secure-local-db.js",
+    "test:penetration": "node --env-file-if-exists=.env --test test/penetration.test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.21.0",
+    "mongoose": "^8.19.1",
+    "multer": "^2.0.2",
+    "sharp": "^0.35.5"
+  }
+}

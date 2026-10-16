@@ -1,0 +1,28 @@
+# Runtime credentials and local environment files
+.env
+.env.*
+!.env.example
+!.env.*.example
+.security/
+
+# Local MongoDB files must never be committed
+.local-db/
+
+# Dependencies and generated files
+node_modules/
+coverage/
+dist/
+tmp/
+*.log
+
+# Private keys and database backups
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.bak
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
