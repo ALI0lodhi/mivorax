@@ -10,7 +10,9 @@ export function couponIsValid(coupon,subtotal,now=new Date()) {
 export function validateCheckout(body,settings) {
  if(!settings.checkoutEnabled) return 'Checkout is not open yet.';
  if(body.coupon!==undefined&&(typeof body.coupon!=='string'||body.coupon.length>80))return 'Invalid discount code.';
- if(body.paymentMethod!=='cod'||!settings.codEnabled) return 'This payment method is unavailable.';
+ if(body.paymentMethod==='cod'){if(!settings.codEnabled) return 'This payment method is unavailable.';}
+ else if(body.paymentMethod==='safepay'){if(!settings.prepaidEnabled) return 'This payment method is unavailable.';}
+ else return 'This payment method is unavailable.';
  if(!Array.isArray(body.items)||!body.items.length||body.items.length>30) return 'Your bag must contain 1–30 items.';
  if(body.items.some(i=>!i||typeof i.productId!=='string'||!i.productId||!Number.isInteger(i.quantity)||i.quantity<1||i.quantity>10)) return 'Invalid item quantity.';
  if(new Set(body.items.map(i=>i.productId)).size!==body.items.length) return 'Duplicate items are not allowed.';

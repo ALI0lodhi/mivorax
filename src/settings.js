@@ -1,15 +1,23 @@
+import { safepayConfigured } from './safepay.js';
+
 export const defaultSettings = {
   codEnabled: true, prepaidEnabled: false, checkoutEnabled: false, customizerEnabled: false, referralsEnabled: false,
-  journalEnabled: true, newsletterEnabled: true, reviewsEnabled: false,
+  journalEnabled: true, reviewsEnabled: false,
   country: 'Pakistan', currency: 'PKR', shippingFee: 250, freeShippingThreshold: 5000,
   deliveryEstimate: 'Delivery estimate confirmed before dispatch', supportEmail: '', supportPhone: '', supportAddress: '',
 };
 export function cleanSettings(input, current = defaultSettings) {
   const next = { ...current };
-  const flags = ['codEnabled', 'checkoutEnabled', 'journalEnabled', 'newsletterEnabled', 'reviewsEnabled'];
+  const flags = ['codEnabled', 'checkoutEnabled', 'journalEnabled', 'reviewsEnabled'];
   for (const key of flags) if (key in input) {
     if (typeof input[key] !== 'boolean') throw Error(`${key} must be true or false.`);
     next[key] = input[key];
+  }
+  // Online card payments can only be switched on once Safepay is configured in the server environment.
+  if ('prepaidEnabled' in input) {
+    if (typeof input.prepaidEnabled !== 'boolean') throw Error('prepaidEnabled must be true or false.');
+    if (input.prepaidEnabled && !safepayConfigured()) throw Error('Add your Safepay keys (SAFEPAY_API_KEY, SAFEPAY_V1_SECRET, SAFEPAY_WEBHOOK_SECRET) to the server before enabling online payments.');
+    next.prepaidEnabled = input.prepaidEnabled;
   }
   for (const key of ['shippingFee', 'freeShippingThreshold']) if (key in input) {
     if (!Number.isSafeInteger(input[key]) || input[key] < 0 || input[key] > 100000000) throw Error('Shipping amounts must be non-negative whole PKR values.');
@@ -20,6 +28,7 @@ export function cleanSettings(input, current = defaultSettings) {
     next[key] = input[key].trim();
   }
   if (next.supportEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.supportEmail)) throw Error('Enter a valid support email.');
-  if (input.prepaidEnabled || input.customizerEnabled || input.referralsEnabled) throw Error('Prepaid payments, customization and referrals need their remaining implementation before enabling.');
-  return { ...next, prepaidEnabled: false, customizerEnabled: false, referralsEnabled: false, country: 'Pakistan', currency: 'PKR' };
+  if (input.customizerEnabled || input.referralsEnabled) throw Error('Customization and referrals need their remaining implementation before enabling.');
+  // If Safepay credentials are ever removed, online payment is forced off everywhere automatically.
+  return { ...next, prepaidEnabled: next.prepaidEnabled && safepayConfigured(), customizerEnabled: false, referralsEnabled: false, country: 'Pakistan', currency: 'PKR' };
 }

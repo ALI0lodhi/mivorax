@@ -3,7 +3,7 @@ import dns from 'node:dns';
 import {mkdirSync,writeFileSync} from 'node:fs';
 import {resolve,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
-const collections=['settings','sites','products','categories','collections','pages','posts','admins','orders','subscribers','reviews','coupons','audits','images.files','images.chunks'];
+const collections=['settings','sites','products','categories','collections','pages','posts','admins','orders','reviews','coupons','audits','images.files','images.chunks'];
 const sourceUri=process.env.MONGODB_URI,targetUri=process.env.MONGODB_TARGET_URI;
 if(!sourceUri||!targetUri)throw Error('Set source MONGODB_URI and MONGODB_TARGET_URI privately.');
 const sourceUrl=new URL(sourceUri),targetUrl=new URL(targetUri);

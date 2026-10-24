@@ -8,7 +8,7 @@ const maintenanceFile=new URL('../.security/database-admin.json',import.meta.url
 const testUri=process.env.MONGODB_TEST_URI||(process.env.MONGODB_URI?.includes('@127.0.0.1:27018/')&&existsSync(maintenanceFile)?JSON.parse(readFileSync(maintenanceFile,'utf8')).adminUri:process.env.MONGODB_URI);
 import { createApp } from '../src/app.js';
 import { seedDatabase } from '../src/initialize.js';
-import { Product, Category, Site, Order, Coupon, Subscriber } from '../src/models.js';
+import { Product, Category, Site, Order, Coupon } from '../src/models.js';
 
 test('MongoDB-backed administration, publishing, media and order lifecycle', { skip: !testUri, timeout: 90000 }, async t => {
   const database = 'mivorax_integration_' + crypto.randomBytes(8).toString('hex');
@@ -25,11 +25,11 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       return { status: response.status, body: await response.json() };
     }
     await t.test('seed is idempotent and public catalog uses actual MongoDB IDs', async () => {
-      await seedDatabase({ email, password });
+      const before = await Product.countDocuments();
+      await seedDatabase({ email, password }); // seeding twice must not duplicate the sample catalog
+      assert.equal(await Product.countDocuments(), before);
       const products = await request('/products');
-      assert.equal(products.body.length, 0); // Seed concepts never appear in the live catalog.
-      assert(products.body.every(p => mongoose.isValidObjectId(p._id)));
-      assert.equal(await Product.countDocuments(), 4);
+      assert(products.body.length > 0 && products.body.every(p => mongoose.isValidObjectId(p._id)));
       assert.equal((await request('/health')).body.transactions, true);
     });
     await t.test('admin authentication and origin allowlist are enforced', async () => {
@@ -96,17 +96,16 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       await request('/admin/products/' + hero.productId + '/archive', { method: 'POST', data: {} });
       await request('/admin/collections/' + collection._id + '/archive', { method: 'POST', data: {} });
       site = (await request('/admin/dashboard')).body.site;
-      site.sections.find(section => section.type === 'newsletter').enabled = false;
       site.sections.find(section => section.type === 'journal').enabled = false;
       const hidden = await request('/admin/site', { method: 'PUT', data: { ...site, _version: site.__v } });
       assert.equal(hidden.status, 200, JSON.stringify(hidden.body));
       assert.equal(hidden.body.sections.find(section => section.type === 'hero').productId, hero.productId);
-      assert(!(await request('/store')).body.site.sections.some(section => ['newsletter', 'journal'].includes(section.type)));
+      assert(!(await request('/store')).body.site.sections.some(section => section.type === 'journal'));
       site = (await request('/admin/dashboard')).body.site;
-      assert.equal(site.sections.find(section => section.type === 'newsletter').enabled, false);
-      site.sections.find(section => section.type === 'newsletter').enabled = true;
+      assert.equal(site.sections.find(section => section.type === 'journal').enabled, false);
+      site.sections.find(section => section.type === 'journal').enabled = true;
       assert.equal((await request('/admin/site', { method: 'PUT', data: { ...site, _version: site.__v } })).status, 200);
-      assert((await request('/store')).body.site.sections.some(section => section.type === 'newsletter'));
+      assert((await request('/store')).body.site.sections.some(section => section.type === 'journal'));
       site = (await request('/admin/dashboard')).body.site;
       site.sections.find(section => section.type === 'hero').productId = String(new mongoose.Types.ObjectId());
       assert.equal((await request('/admin/site', { method: 'PUT', data: { ...site, _version: site.__v } })).status, 400);
@@ -133,17 +132,66 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       const bad = new FormData(); bad.append('image', new Blob(['not an image']), 'bad.png');
       assert.equal((await fetch(origin + '/api/admin/images', { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: bad })).status, 400);
     });
-    await t.test('newsletter consent and feature controls are enforced in the database', async () => {
-      assert.equal((await request('/newsletter', { method: 'POST', data: { email: 'reader@example.test', consent: false } })).status, 400);
-      assert.equal((await request('/newsletter', { method: 'POST', data: { email: 'reader@example.test', consent: true } })).status, 200);
-      const sub = await Subscriber.findOne({ email: 'reader@example.test' }); assert(sub.consentedAt);
-      assert.equal((await request('/admin/subscribers/' + sub._id, { method: 'PUT', data: { active: false } })).status, 200);
-      assert.equal((await Subscriber.findById(sub._id)).active, false);
-      await request('/admin/settings', { method: 'PUT', data: { journalEnabled: false, newsletterEnabled: false } });
+    await t.test('journal feature control hides scheduled content and posts from the public API', async () => {
+      await request('/admin/settings', { method: 'PUT', data: { journalEnabled: false } });
       assert.deepEqual((await request('/posts')).body, []);
-      assert(!(await request('/store')).body.site.sections.some(s => ['newsletter', 'journal'].includes(s.type)));
-      assert.equal((await request('/newsletter', { method: 'POST', data: { email: 'reader@example.test', consent: true } })).status, 403);
+      assert(!(await request('/store')).body.site.sections.some(s => s.type === 'journal'));
+      await request('/admin/settings', { method: 'PUT', data: { journalEnabled: true } });
+    });
+    await t.test('online payments require Safepay keys before they can be switched on', async () => {
+      // No Safepay environment configured here, so enabling online payments must be refused.
       assert.equal((await request('/admin/settings', { method: 'PUT', data: { prepaidEnabled: true } })).status, 400);
+      assert.equal((await request('/store')).body.settings.prepaidEnabled, false);
+    });
+    await t.test('Safepay order stays pending until a verified webhook confirms payment and deducts stock', async () => {
+      const realFetch = globalThis.fetch;
+      const sfpyEnv = { SAFEPAY_ENV: 'sandbox', SAFEPAY_API_KEY: 'sec_test', SAFEPAY_V1_SECRET: 'v1_test_secret', SAFEPAY_WEBHOOK_SECRET: 'wh_test_secret' };
+      Object.assign(process.env, sfpyEnv);
+      let initCalls = 0;
+      // Simulate Safepay's /order/v1/init without any real network call or keys.
+      globalThis.fetch = (url, opts) => { if (String(url).includes('getsafepay.com')) { initCalls++; return Promise.resolve(new Response(JSON.stringify({ data: { token: 'trk_' + crypto.randomBytes(6).toString('hex') } }), { status: 200, headers: { 'Content-Type': 'application/json' } })); } return realFetch(url, opts); };
+      try {
+        assert.equal((await request('/admin/settings', { method: 'PUT', data: { checkoutEnabled: true, supportEmail: 'support@example.test', prepaidEnabled: true } })).status, 200);
+        assert.equal((await request('/store')).body.settings.prepaidEnabled, true);
+        const stockBefore = (await Product.findById(product._id)).stock;
+        const payload = { customer: { name: 'Online buyer', email: 'online@example.test', phone: '03007654321', address: 'Card street', city: 'Karachi', country: 'Pakistan' }, paymentMethod: 'safepay', items: [{ productId: product._id, quantity: 1 }] };
+        const placed = await request('/orders', { method: 'POST', data: payload });
+        assert.equal(placed.status, 201, JSON.stringify(placed.body));
+        assert.equal(placed.body.status, 'pending_payment');
+        assert.equal(placed.body.paymentStatus, 'unpaid');
+        assert(typeof placed.body.checkoutUrl === 'string' && placed.body.checkoutUrl.includes('/checkout/pay?'), placed.body.checkoutUrl);
+        assert.equal(initCalls, 1);
+        assert.equal((await Product.findById(product._id)).stock, stockBefore); // unpaid orders never reserve stock
+        const order = await Order.findOne({ reference: placed.body.reference }).select('+safepayToken').lean();
+        assert(order.safepayToken && order.safepayToken.startsWith('trk_'));
+        const paid = { type: 'payment:succeeded', data: { tracker: order.safepayToken, state: 'TRACKER_ENDED', amount: order.total * 100 } };
+        const body = JSON.stringify(paid);
+        const sig = crypto.createHmac('sha512', sfpyEnv.SAFEPAY_WEBHOOK_SECRET).update(Buffer.from(JSON.stringify(paid.data))).digest('hex');
+        const sendHook = headers => fetch(origin + '/api/payments/safepay/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body });
+        assert.equal((await sendHook({ 'x-sfpy-signature': 'deadbeef' })).status, 401); // forged signature rejected
+        assert.equal((await Order.findById(order._id)).paymentStatus, 'unpaid');
+        assert.equal((await sendHook({ 'x-sfpy-signature': sig })).status, 200); // genuine webhook accepted
+        const afterPaid = await Order.findById(order._id);
+        assert.equal(afterPaid.paymentStatus, 'paid');
+        assert.equal(afterPaid.status, 'confirmed');
+        assert.equal((await Product.findById(product._id)).stock, stockBefore - 1); // stock deducted on payment
+        assert.equal((await sendHook({ 'x-sfpy-signature': sig })).status, 200); // replay is idempotent
+        assert.equal((await Product.findById(product._id)).stock, stockBefore - 1); // no double deduction
+        const reload = await Order.findById(order._id).lean();
+        assert.equal((await request('/admin/orders/' + order._id, { method: 'PUT', data: { _version: reload.__v, status: 'cancelled' } })).status, 200);
+        assert.equal((await Product.findById(product._id)).stock, stockBefore); // paid order cancel restores stock
+        const abandoned = await request('/orders', { method: 'POST', data: payload });
+        assert.equal(abandoned.body.status, 'pending_payment');
+        const ab = await Order.findOne({ reference: abandoned.body.reference }).lean();
+        assert.equal((await request('/admin/orders/' + ab._id, { method: 'PUT', data: { _version: ab.__v, status: 'cancelled' } })).status, 200);
+        assert.equal((await Product.findById(product._id)).stock, stockBefore); // never-paid order does NOT restock
+        for (const k of Object.keys(sfpyEnv)) delete process.env[k];
+        assert.equal((await request('/store')).body.settings.prepaidEnabled, false); // keys gone → forced off
+        assert.equal((await request('/orders', { method: 'POST', data: payload })).status, 400); // and refused
+      } finally {
+        globalThis.fetch = realFetch;
+        for (const k of Object.keys(sfpyEnv)) delete process.env[k];
+      }
     });
     await t.test('checkout uses database prices and enforces single-use coupons under concurrency', async () => {
       assert.equal((await request('/admin/settings', { method: 'PUT', data: { checkoutEnabled: true, supportEmail: 'support@example.test' } })).status, 200);
@@ -165,17 +213,17 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       assert.equal((await request('/admin/orders/' + order._id, { method: 'PUT', data: { _version: order.__v, status: 'cancelled' } })).status, 409);
       assert.equal((await Product.findById(product._id)).stock, 2);
       assert.equal((await request('/admin/customers')).body.items[0].spent, 0);
-      const sample = await Product.findOne({ demo: true });
-      assert.equal((await request('/orders', { method: 'POST', data: { ...payload, coupon: '', items: [{ productId: String(sample._id), quantity: 1 }] } })).status, 400);
+      // Ordering a product that is not in the live catalog is rejected.
+      assert.equal((await request('/orders', { method: 'POST', data: { ...payload, coupon: '', items: [{ productId: String(new mongoose.Types.ObjectId()), quantity: 1 }] } })).status, 400);
     });
     await t.test('security boundaries, malformed input, session revocation and throttling', async()=>{
-      for(const path of ['/admin/dashboard','/admin/products','/admin/orders','/admin/customers','/admin/subscribers','/admin/audit','/admin/images'])assert.equal((await request(path,{auth:false})).status,401,path);
+      for(const path of ['/admin/dashboard','/admin/products','/admin/orders','/admin/customers','/admin/audit','/admin/images'])assert.equal((await request(path,{auth:false})).status,401,path);
       assert.equal((await request('/admin/site',{method:'PUT',data:{},auth:false})).status,401);
       assert.equal((await request('/admin/login',{method:'POST',data:{email:{$ne:null},password:'anything'},auth:false})).status,400);
-      assert.equal((await request('/newsletter',{method:'POST',data:[]})).status,400);
+      assert.equal((await request('/orders',{method:'POST',data:[]})).status,400);
       assert.equal((await request('/coupons/validate',{method:'POST',data:{items:[null]}})).status,400);
       const health=await fetch(origin+'/api/health');assert.equal(health.headers.get('x-content-type-options'),'nosniff');assert.equal(health.headers.get('x-powered-by'),null);assert.equal(health.headers.get('cache-control'),'no-store');
-      const malformed=await fetch(origin+'/api/newsletter',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"secret":"hidden",'});assert.equal(malformed.status,400);assert(!JSON.stringify(await malformed.json()).includes('hidden'));
+      const malformed=await fetch(origin+'/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"secret":"hidden",'});assert.equal(malformed.status,400);assert(!JSON.stringify(await malformed.json()).includes('hidden'));
       assert.equal((await fetch(origin+'/.env')).status,404);
       assert.equal((await request('/admin/logout',{method:'POST',data:{}})).status,200);
       assert.equal((await request('/admin/dashboard')).status,401);
