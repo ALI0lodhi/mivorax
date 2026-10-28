@@ -13,7 +13,7 @@ export function cleanSettings(input, current = defaultSettings) {
     if (typeof input[key] !== 'boolean') throw Error(`${key} must be true or false.`);
     next[key] = input[key];
   }
-  // Online card payments can only be switched on once Safepay is configured in the server environment.
+  // Online payments can only be enabled once Safepay is configured.
   if ('prepaidEnabled' in input) {
     if (typeof input.prepaidEnabled !== 'boolean') throw Error('prepaidEnabled must be true or false.');
     if (input.prepaidEnabled && !safepayConfigured()) throw Error('Add your Safepay keys (SAFEPAY_API_KEY, SAFEPAY_V1_SECRET, SAFEPAY_WEBHOOK_SECRET) to the server before enabling online payments.');
@@ -29,6 +29,6 @@ export function cleanSettings(input, current = defaultSettings) {
   }
   if (next.supportEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.supportEmail)) throw Error('Enter a valid support email.');
   if (input.customizerEnabled || input.referralsEnabled) throw Error('Customization and referrals need their remaining implementation before enabling.');
-  // If Safepay credentials are ever removed, online payment is forced off everywhere automatically.
+  // Force online payment off if the Safepay keys are gone.
   return { ...next, prepaidEnabled: next.prepaidEnabled && safepayConfigured(), customizerEnabled: false, referralsEnabled: false, country: 'Pakistan', currency: 'PKR' };
 }

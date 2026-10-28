@@ -6,7 +6,7 @@
     "dev": "node --watch --env-file-if-exists=.env src/index.js",
     "start": "node --env-file-if-exists=.env src/start.js",
     "seed": "node --env-file-if-exists=.env src/seed.js",
-    "test": "node --test test/commerce.test.js test/catalog.test.js test/security.test.js",
+    "test": "node --test test/commerce.test.js test/catalog.test.js test/security.test.js test/postex.test.js test/currency.test.js",
     "db:local": "node --env-file-if-exists=.env src/local-db.js",
     "test:integration": "node --env-file-if-exists=.env --test test/integration.test.js",
     "db:secure": "node --env-file-if-exists=.env src/secure-local-db.js",

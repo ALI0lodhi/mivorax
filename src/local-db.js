@@ -7,7 +7,7 @@ import { MongoClient } from 'mongodb';
 const port = Number(process.env.LOCAL_MONGODB_PORT || 27018);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dbPath = resolve(root, '.local-db');
-const uri = process.env.MONGODB_URI || `mongodb://127.0.0.1:${port}/mivorax?replicaSet=mivorax-rs`;
+const uri = `mongodb://127.0.0.1:${port}/?directConnection=true`;
 const keyPath=resolve(root,'.security/replica.key');
 let child;
 const probe = new MongoClient(uri, { serverSelectionTimeoutMS: 1000 });

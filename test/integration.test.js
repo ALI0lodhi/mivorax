@@ -8,7 +8,7 @@ const maintenanceFile=new URL('../.security/database-admin.json',import.meta.url
 const testUri=process.env.MONGODB_TEST_URI||(process.env.MONGODB_URI?.includes('@127.0.0.1:27018/')&&existsSync(maintenanceFile)?JSON.parse(readFileSync(maintenanceFile,'utf8')).adminUri:process.env.MONGODB_URI);
 import { createApp } from '../src/app.js';
 import { seedDatabase } from '../src/initialize.js';
-import { Product, Category, Site, Order, Coupon } from '../src/models.js';
+import { Product, Category, Collection, Site, Order, Coupon, Review } from '../src/models.js';
 
 test('MongoDB-backed administration, publishing, media and order lifecycle', { skip: !testUri, timeout: 90000 }, async t => {
   const database = 'mivorax_integration_' + crypto.randomBytes(8).toString('hex');
@@ -139,7 +139,8 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       await request('/admin/settings', { method: 'PUT', data: { journalEnabled: true } });
     });
     await t.test('online payments require Safepay keys before they can be switched on', async () => {
-      // No Safepay environment configured here, so enabling online payments must be refused.
+      // Clear any Safepay env (a local .env may set mock mode) so this asserts the unconfigured state.
+      for (const k of ['SAFEPAY_ENV', 'SAFEPAY_API_KEY', 'SAFEPAY_V1_SECRET', 'SAFEPAY_WEBHOOK_SECRET']) delete process.env[k];
       assert.equal((await request('/admin/settings', { method: 'PUT', data: { prepaidEnabled: true } })).status, 400);
       assert.equal((await request('/store')).body.settings.prepaidEnabled, false);
     });
@@ -149,7 +150,12 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       Object.assign(process.env, sfpyEnv);
       let initCalls = 0;
       // Simulate Safepay's /order/v1/init without any real network call or keys.
-      globalThis.fetch = (url, opts) => { if (String(url).includes('getsafepay.com')) { initCalls++; return Promise.resolve(new Response(JSON.stringify({ data: { token: 'trk_' + crypto.randomBytes(6).toString('hex') } }), { status: 200, headers: { 'Content-Type': 'application/json' } })); } return realFetch(url, opts); };
+      const json = body => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      globalThis.fetch = (url, opts) => {
+        if (String(url).includes('/order/payments/v3/')) { initCalls++; return json({ data: { tracker: { token: 'trk_' + crypto.randomBytes(6).toString('hex'), state: 'TRACKER_STARTED' } } }); }
+        if (String(url).includes('/client/passport/v1/token')) return json({ data: 'tbt_test_token' });
+        return realFetch(url, opts);
+      };
       try {
         assert.equal((await request('/admin/settings', { method: 'PUT', data: { checkoutEnabled: true, supportEmail: 'support@example.test', prepaidEnabled: true } })).status, 200);
         assert.equal((await request('/store')).body.settings.prepaidEnabled, true);
@@ -159,11 +165,13 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
         assert.equal(placed.status, 201, JSON.stringify(placed.body));
         assert.equal(placed.body.status, 'pending_payment');
         assert.equal(placed.body.paymentStatus, 'unpaid');
-        assert(typeof placed.body.checkoutUrl === 'string' && placed.body.checkoutUrl.includes('/checkout/pay?'), placed.body.checkoutUrl);
+        assert(typeof placed.body.checkoutUrl === 'string' && placed.body.checkoutUrl.includes('/embedded/?'), placed.body.checkoutUrl);
         assert.equal(initCalls, 1);
         assert.equal((await Product.findById(product._id)).stock, stockBefore); // unpaid orders never reserve stock
         const order = await Order.findOne({ reference: placed.body.reference }).select('+safepayToken').lean();
         assert(order.safepayToken && order.safepayToken.startsWith('trk_'));
+        assert.equal(order.unseen, false); // an unpaid online order is not a new order yet
+        assert.equal(order.unseen, false); // an unpaid online order is not a new order yet
         const paid = { type: 'payment:succeeded', data: { tracker: order.safepayToken, state: 'TRACKER_ENDED', amount: order.total * 100 } };
         const body = JSON.stringify(paid);
         const sig = crypto.createHmac('sha512', sfpyEnv.SAFEPAY_WEBHOOK_SECRET).update(Buffer.from(JSON.stringify(paid.data))).digest('hex');
@@ -174,6 +182,8 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
         const afterPaid = await Order.findById(order._id);
         assert.equal(afterPaid.paymentStatus, 'paid');
         assert.equal(afterPaid.status, 'confirmed');
+        assert.equal(afterPaid.unseen, true); // paying makes it a new order
+        assert.equal(afterPaid.unseen, true); // paying makes it a new order
         assert.equal((await Product.findById(product._id)).stock, stockBefore - 1); // stock deducted on payment
         assert.equal((await sendHook({ 'x-sfpy-signature': sig })).status, 200); // replay is idempotent
         assert.equal((await Product.findById(product._id)).stock, stockBefore - 1); // no double deduction
@@ -193,6 +203,29 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
         for (const k of Object.keys(sfpyEnv)) delete process.env[k];
       }
     });
+    await t.test('mock payment mode clicks through to a paid order with no gateway keys', async () => {
+      process.env.SAFEPAY_ENV = 'mock';
+      try {
+        assert.equal((await request('/admin/settings', { method: 'PUT', data: { checkoutEnabled: true, supportEmail: 'support@example.test', prepaidEnabled: true } })).status, 200);
+        const stockBefore = (await Product.findById(product._id)).stock;
+        const payload = { customer: { name: 'Demo buyer', email: 'demo@example.test', phone: '03001112222', address: 'Demo street', city: 'Lahore', country: 'Pakistan' }, paymentMethod: 'safepay', items: [{ productId: product._id, quantity: 1 }] };
+        const placed = await request('/orders', { method: 'POST', data: payload });
+        assert.equal(placed.status, 201, JSON.stringify(placed.body));
+        assert(placed.body.checkoutUrl.includes('/api/payments/safepay/mock?'), placed.body.checkoutUrl);
+        const mockPage = await fetch(origin + placed.body.checkoutUrl.slice(placed.body.checkoutUrl.indexOf('/api')));
+        assert.equal(mockPage.status, 200);
+        assert((await mockPage.text()).toLowerCase().includes('simulated'));
+        const order = await Order.findOne({ reference: placed.body.reference }).select('+safepayToken').lean();
+        const pay = await fetch(origin + '/api/payments/safepay/mock/pay?order=' + order.reference + '&token=' + order.safepayToken, { redirect: 'manual' });
+        assert([301, 302, 303, 307, 308].includes(pay.status));
+        assert.equal((await Order.findById(order._id)).paymentStatus, 'paid');
+        assert.equal((await Product.findById(product._id)).stock, stockBefore - 1);
+      } finally {
+        delete process.env.SAFEPAY_ENV;
+        const cancel = await Order.findOne({ 'customer.email': 'demo@example.test', paymentStatus: 'paid' }).lean();
+        if (cancel) await request('/admin/orders/' + cancel._id, { method: 'PUT', data: { _version: cancel.__v, status: 'cancelled' } });
+      }
+    });
     await t.test('checkout uses database prices and enforces single-use coupons under concurrency', async () => {
       assert.equal((await request('/admin/settings', { method: 'PUT', data: { checkoutEnabled: true, supportEmail: 'support@example.test' } })).status, 200);
       coupon = (await request('/admin/coupons', { method: 'POST', data: { code: 'ONE-USE', kind: 'percentage', amount: 10, minOrder: 0, usageLimit: 1, enabled: true } })).body;
@@ -205,6 +238,7 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       assert.equal((await Coupon.findById(coupon._id)).used, 1);
       const tracking = await request('/orders/track', { method: 'POST', data: { reference: placed.reference, token: placed.token } });
       assert.equal(tracking.status, 200); assert(!tracking.body.customer);
+      assert.deepEqual([tracking.body.subtotal, tracking.body.shipping, tracking.body.discount, tracking.body.coupon, tracking.body.items[0].unitPrice], [500, 250, 50, 'ONE-USE', 500]); // enough for a receipt, without personal details
       assert.equal((await request('/orders/track', { method: 'POST', data: { reference: placed.reference, token: 'wrong' } })).status, 404);
       let order = await Order.findOne({ reference: placed.reference }).lean();
       assert.equal((await request('/admin/orders/' + order._id, { method: 'PUT', data: { _version: order.__v, status: 'cancelled' } })).status, 200);
@@ -215,6 +249,128 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       assert.equal((await request('/admin/customers')).body.items[0].spent, 0);
       // Ordering a product that is not in the live catalog is rejected.
       assert.equal((await request('/orders', { method: 'POST', data: { ...payload, coupon: '', items: [{ productId: String(new mongoose.Types.ObjectId()), quantity: 1 }] } })).status, 400);
+    });
+    await t.test('deleting a record removes whatever pointed at it instead of being blocked', async () => {
+      const make = async (path, data) => { const r = await request(path, { method: 'POST', data }); assert.equal(r.status, 201, JSON.stringify(r.body)); return r.body; };
+      const parent = await make('/admin/categories', { name: 'Del parent', slug: 'del-parent', status: 'published' });
+      const kid = await make('/admin/categories', { name: 'Del kid', slug: 'del-kid', parent: 'del-parent', status: 'published' });
+      const item = await make('/admin/products', { name: 'Del item', slug: 'del-item', category: 'del-kid', price: 100, stock: 1, status: 'published', images: [] });
+      const group = await make('/admin/collections', { name: 'Del group', slug: 'del-group', status: 'published', productIds: [item._id] });
+      await Review.create({ productId: item._id, author: 'Zed', text: 'Nice item here.', rating: 5, status: 'published' });
+      const site = (await request('/admin/dashboard')).body.site;
+      site.navigation.push({ label: 'Kid link', href: '/shop?category=del-kid', enabled: true, category: 'del-kid' });
+      site.sections.find(s => s.type === 'hero').productId = item._id;
+      site.sections.find(s => s.type === 'products').categorySlug = 'del-kid';
+      assert.equal((await request('/admin/site', { method: 'PUT', data: { ...site, _version: site.__v } })).status, 200);
+
+      // The admin is told what will happen before confirming.
+      assert.deepEqual((await request('/admin/delete-impact/categories/' + kid._id)).body.lines, ['1 product will move to “Del parent”', 'removed from 1 homepage section', '1 menu link will be removed']);
+      const productImpact = (await request('/admin/delete-impact/products/' + item._id)).body;
+      assert.deepEqual(productImpact.lines, ['removed from 1 collection', 'removed from 1 homepage section', '1 review of this product will be deleted']);
+
+      // A category in use can be deleted: its product moves up, and the menu link and homepage section are cleaned.
+      assert.equal((await request('/admin/categories/' + kid._id, { method: 'DELETE' })).status, 200);
+      assert.equal((await Product.findById(item._id)).category, 'del-parent');
+      const afterCategory = await Site.findOne({ key: 'website' }).lean();
+      assert(!afterCategory.navigation.some(l => l.category === 'del-kid'));
+      assert.equal(afterCategory.sections.find(s => s.type === 'products').categorySlug, '');
+
+      // A product in a collection, on the homepage and with reviews can be deleted too.
+      assert.equal((await request('/admin/products/' + item._id, { method: 'DELETE' })).status, 200);
+      assert.deepEqual((await Collection.findById(group._id)).productIds, []);
+      assert(!(await Site.findOne({ key: 'website' }).lean()).sections.find(s => s.type === 'hero').productId);
+      assert.equal(await Review.countDocuments({ author: 'Zed' }), 0);
+
+      // With no parent category to move into, the products are archived rather than lost.
+      const solo = await make('/admin/categories', { name: 'Del solo', slug: 'del-solo', status: 'published' });
+      const other = await make('/admin/products', { name: 'Del other', slug: 'del-other', category: 'del-solo', price: 100, stock: 1, status: 'published', images: [] });
+      assert.equal((await request('/admin/categories/' + solo._id, { method: 'DELETE' })).status, 200);
+      assert((await Product.findById(other._id)).archivedAt);
+
+      for (const [path, record] of [['products', other], ['collections', group], ['categories', parent]]) assert.equal((await request('/admin/' + path + '/' + record._id, { method: 'DELETE' })).status, 200);
+    });
+    await t.test('new orders are counted until the admin has seen them', async () => {
+      const newOrders = async () => (await request('/admin/badges')).body.newOrders;
+      const place = async () => { const placed = await request('/orders', { method: 'POST', data: { customer: { name: 'Badge Buyer', email: 'badge@example.test', phone: '03001234567', address: 'House 1', city: 'Karachi', country: 'Pakistan' }, paymentMethod: 'cod', items: [{ productId: product._id, quantity: 1 }] } }); assert.equal(placed.status, 201, JSON.stringify(placed.body)); return Order.findOne({ reference: placed.body.reference }).lean(); };
+      const cancel = async id => { const o = await Order.findById(id).lean(); assert.equal((await request('/admin/orders/' + id, { method: 'PUT', data: { _version: o.__v, status: 'cancelled' } })).status, 200); };
+      await request('/admin/orders/seen-all', { method: 'POST', data: {} });
+      assert.equal(await newOrders(), 0);
+
+      const first = await place();
+      assert.equal(first.unseen, true);
+      assert.equal(await newOrders(), 1);
+      assert.equal((await request('/admin/dashboard')).body.newOrders, 1);
+
+      // Opening an order clears it, without changing its version (an open order form can still be saved).
+      assert.equal((await request('/admin/orders/' + first._id + '/seen', { method: 'POST', data: {} })).status, 200);
+      assert.equal(await newOrders(), 0);
+      assert.equal((await Order.findById(first._id)).__v, first.__v);
+      assert.equal((await request('/admin/orders/' + first._id + '/seen', { method: 'POST', data: {} })).status, 200); // harmless to repeat
+      await cancel(first._id); // gives the stock back so two more orders fit
+
+      const second = await place(), third = await place();
+      assert.equal(await newOrders(), 2);
+      assert.equal((await request('/admin/orders/seen-all', { method: 'POST', data: {} })).body.cleared, 2);
+      assert.equal(await newOrders(), 0);
+      for (const order of [second, third]) await cancel(order._id);
+    });
+    await t.test('one-click PostEx booking sends the customer details, saves the tracking number and cannot double-book', async () => {
+      const realFetch = globalThis.fetch;
+      const sent = [];
+      const json = body => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      globalThis.fetch = (url, opts) => {
+        const u = String(url);
+        if (u.includes('/v2/get-operational-city')) return json({ statusCode: '200', statusMessage: 'OK', dist: [{ operationalCityName: 'Karachi' }, { operationalCityName: 'Lahore' }] });
+        if (u.includes('/v3/create-order')) { sent.push({ token: opts.headers.token, body: JSON.parse(opts.body) }); return json({ statusCode: '200', statusMessage: 'ORDER HAS BEEN CREATED', dist: { trackingNumber: '3010100012' + sent.length } }); }
+        if (u.includes('/v1/cancel-order')) { sent.push({ cancel: JSON.parse(opts.body) }); return json({ statusCode: '200', statusMessage: 'CANCELLED' }); }
+        return realFetch(url, opts);
+      };
+      const place = async city => { const placed = await request('/orders', { method: 'POST', data: { customer: { name: 'PostEx Buyer', email: 'px@example.test', phone: '+923001234567', address: 'House 1, Street 2', city, country: 'Pakistan' }, paymentMethod: 'cod', items: [{ productId: product._id, quantity: 1 }] } }); assert.equal(placed.status, 201, JSON.stringify(placed.body)); return Order.findOne({ reference: placed.body.reference }).lean(); };
+      const cancelOrder = async id => { const o = await Order.findById(id).lean(); assert.equal((await request('/admin/orders/' + id, { method: 'PUT', data: { _version: o.__v, status: 'cancelled' } })).status, 200); };
+      const book = (id, data = {}) => request('/admin/orders/' + id + '/postex', { method: 'POST', data });
+      const orders = [];
+      try {
+        const first = await place('karachi'); orders.push(first);
+        delete process.env.POSTEX_API_TOKEN;
+        assert.equal((await book(first._id)).status, 400); // not set up yet
+        assert.equal((await request('/admin/postex/cities')).body.configured, false);
+
+        process.env.POSTEX_API_TOKEN = 'pk_test_token';
+        const cities = await request('/admin/postex/cities?city=karachi');
+        assert.deepEqual([cities.body.configured, cities.body.match], [true, 'Karachi']);
+        const booked = await book(first._id);
+        assert.equal(booked.status, 200, JSON.stringify(booked.body));
+        assert.equal(booked.body.postexState, 'booked');
+        assert.equal(booked.body.postexTracking, '30101000121');
+        assert.equal(booked.body.courier, 'PostEx');
+        assert.equal(booked.body.trackingNumber, '30101000121');
+        assert.equal(booked.body.status, 'processing');
+        assert.equal(sent[0].token, 'pk_test_token');
+        assert.deepEqual({ ...sent[0].body, orderDetail: undefined, transactionNotes: undefined }, { cityName: 'Karachi', customerName: 'PostEx Buyer', customerPhone: '03001234567', deliveryAddress: 'House 1, Street 2', invoiceDivision: 1, invoicePayment: first.total, items: 1, orderDetail: undefined, orderRefNumber: first.reference, orderType: 'Normal', transactionNotes: undefined });
+        assert.equal((await book(first._id)).status, 409); // already booked
+        assert.equal(sent.length, 1);
+
+        const second = await place('Atlantis'); orders.push(second);
+        const refused = await book(second._id);
+        assert.equal(refused.status, 422);
+        assert.match(refused.body.error, /does not recognise the city "Atlantis"/);
+        assert.equal((await Order.findById(second._id)).postexState, ''); // nothing was claimed or sent
+        assert.equal(sent.length, 1);
+        const retried = await book(second._id, { cityName: 'Lahore' });
+        assert.equal(retried.status, 200, JSON.stringify(retried.body));
+        assert.equal(sent[1].body.cityName, 'Lahore');
+
+        const cancelled = await request('/admin/orders/' + first._id + '/postex/cancel', { method: 'POST', data: {} });
+        assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body));
+        assert.deepEqual(sent[2].cancel, { trackingNumber: '30101000121' });
+        assert.equal(cancelled.body.postexState, 'cancelled');
+        assert(!cancelled.body.courier && !cancelled.body.trackingNumber);
+        assert.equal((await request('/admin/orders/' + first._id + '/postex/cancel', { method: 'POST', data: {} })).status, 400);
+      } finally {
+        globalThis.fetch = realFetch;
+        delete process.env.POSTEX_API_TOKEN;
+        for (const o of orders) await cancelOrder(o._id);
+      }
     });
     await t.test('security boundaries, malformed input, session revocation and throttling', async()=>{
       for(const path of ['/admin/dashboard','/admin/products','/admin/orders','/admin/customers','/admin/audit','/admin/images'])assert.equal((await request(path,{auth:false})).status,401,path);
@@ -235,8 +391,34 @@ test('MongoDB-backed administration, publishing, media and order lifecycle', { s
       assert.equal((await request('/admin/dashboard',{headers:{Authorization:'Bearer '+token.slice(0,-4)+'xxxx'}})).status,401);
       let limited;for(let i=0;i<12;i++)limited=await request('/admin/login',{method:'POST',data:{email,password:'incorrect'},auth:false});assert.equal(limited.status,429);
     });
-    await t.test('reviews require a delivered order and administration activity is recorded', async () => {
-      assert.equal((await request('/admin/reviews', { method: 'POST', data: { productId: product._id, orderReference: 'NO-ORDER', author: 'Test', rating: 5, text: 'Not a genuine review.', status: 'published' } })).status, 400);
+    await t.test('customer reviews wait for admin approval and administration activity is recorded', async () => {
+      const review = { productId: product._id, name: 'Sana', rating: 4, message: 'Lovely fragrance, lasts all day.' };
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, rating: undefined } })).status, 400);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, rating: 6 } })).status, 400);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, rating: 3.5 } })).status, 400);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, message: 'ab' } })).status, 400);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, email: 'not-an-email' } })).status, 400);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, productId: String(new mongoose.Types.ObjectId()) } })).status, 404);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, name: 'Bot', website: 'spam.example' } })).status, 201);
+      assert.equal(await Review.countDocuments({ author: 'Bot' }), 0);
+      assert.equal((await request('/reviews', { method: 'POST', data: { ...review, message: 'Great, visit www.spam.example now' } })).status, 400);
+      assert.equal((await request('/reviews', { method: 'POST', data: review })).status, 201);
+      assert.equal((await request('/reviews', { method: 'POST', data: review })).status, 201);
+      assert.equal(await Review.countDocuments({ author: 'Sana' }), 1);
+      let blocked;
+      for (let i = 0; i < 10 && !blocked; i++) { const attempt = await request('/reviews', { method: 'POST', data: review }); if (attempt.status === 429) blocked = attempt; }
+      assert(blocked, 'review form must stop accepting submissions after a handful per hour');
+      assert.match(blocked.body.error, /several reviews/);
+      const saved = await Review.findOne({ author: 'Sana' }).lean();
+      assert.equal(saved.status, 'pending');
+      assert.equal(saved.rating, 4);
+      assert.equal((await request('/store')).body.settings.reviewsEnabled, false); // approved reviews must show on product pages even with the homepage section off
+      assert(!(await request('/store')).body.reviews.some(r => r._id === String(saved._id)));
+      assert.equal((await request('/admin/reviews', { method: 'POST', data: { productId: product._id, author: 'Admin', text: 'Admins cannot add reviews.' } })).status, 404);
+      assert.equal((await request('/admin/reviews/' + saved._id, { method: 'PUT', data: { _version: saved.__v, status: 'published', text: 'Edited by admin' } })).status, 200);
+      assert.equal((await Review.findById(saved._id)).text, saved.text);
+      const shown = (await request('/store')).body.reviews.find(r => r._id === String(saved._id));
+      assert(shown && shown.author === 'Sana' && shown.rating === 4 && !('email' in shown));
       assert((await request('/admin/audit')).body.total > 10);
       assert.equal((await Site.findOne({ key: 'website' })).sections[0].title, 'Database-driven heading');
     });
